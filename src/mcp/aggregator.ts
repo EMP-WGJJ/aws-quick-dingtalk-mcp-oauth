@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { createHash } from 'crypto';
 import { IStorage } from '../storage/interface';
 import { createAuthMiddleware } from './middleware';
 
@@ -24,6 +25,45 @@ import { createAuthMiddleware } from './middleware';
 
 const DINGTALK_MCP_GW_BASE = 'https://mcp-gw.dingtalk.com/server';
 const PREFIX_SEP = '__';
+
+// 工具全名（<server>__<tool>）长度上限。
+// 实测 Amazon Quick 拒绝过长工具名：comm-a 最长 38 成功，comm-b（teambition）最长 44 失败。
+// 取 38 为安全阈值，超过则缩短工具名部分并维护反向映射。
+const MAX_TOOL_NAME_LEN = 38;
+
+// 缩短名 → { server, tool } 的全局反向映射（tools/list 时填充，tools/call 时查询路由）
+const shortNameMap = new Map<string, { server: string; tool: string }>();
+
+/**
+ * 生成符合 Amazon Quick / MCP 规范的工具全名：
+ * 1) 字符消毒：工具名只允许 [a-zA-Z0-9_-]，其它字符（中文、点号等）替换为下划线，
+ *    避免 Quick 校验拒绝（实测 teambition 的中文名/点号名导致整组 Creation failed）。
+ * 2) 长度控制：全名 <server>__<tool> 不超过 MAX_TOOL_NAME_LEN，超出则截断 + 哈希后缀。
+ * 两种变换都登记反向映射（缩短/消毒名 → 原始 server+tool），tools/call 用原始名调用上游。
+ */
+function buildToolName(server: string, tool: string): string {
+  // 1) 消毒非法字符：非 [a-zA-Z0-9_-] 一律转下划线，再折叠/去首尾下划线
+  let safeTool = tool.replace(/[^a-zA-Z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '');
+
+  const prefix = `${server}${PREFIX_SEP}`;
+  const hash = createHash('sha1').update(`${server}/${tool}`).digest('hex').slice(0, 4);
+
+  // 消毒后若为空（如纯中文名），或仍含非 ASCII（保险），用哈希兜底保证唯一非空
+  const asciiSafe = /^[a-zA-Z0-9_-]+$/.test(safeTool) && safeTool.length > 0;
+
+  let finalName: string;
+  if (asciiSafe && `${prefix}${safeTool}`.length <= MAX_TOOL_NAME_LEN) {
+    finalName = `${prefix}${safeTool}`;
+  } else {
+    const suffixLen = 1 + hash.length;
+    const keep = Math.max(1, MAX_TOOL_NAME_LEN - prefix.length - suffixLen);
+    const base = asciiSafe ? safeTool.slice(0, keep) : 'tool';
+    finalName = `${prefix}${base}_${hash}`;
+  }
+
+  shortNameMap.set(finalName, { server, tool });
+  return finalName;
+}
 
 const SERVER_LABEL: Record<string, string> = {
   bot: '机器人消息', report: '钉钉日志', aitable: 'AI表格', doc: '钉钉文档',
@@ -133,25 +173,75 @@ function safeJson(s: string): any {
   try { return JSON.parse(s); } catch { return { _raw: s }; }
 }
 
+/**
+ * Schema 消毒：修正钉钉上游返回的不合规 inputSchema，确保符合 JSON Schema Draft 7，
+ * 否则 Amazon Quick 的 publish 校验会拒绝整个 connector（实测 teambition 的
+ * create_task / update_project_info 的 required 引用了 properties 中不存在的字段）。
+ *
+ * 处理规则（递归）：
+ * - required 数组中剔除 properties 里不存在的字段名（保留合法项）；剔空则删除 required
+ * - 递归处理 properties 子 schema 与 items
+ * 只修正有问题的部分，合规 schema 原样返回；不改变工具的实际可用参数。
+ */
+function sanitizeSchema(schema: any): any {
+  if (!schema || typeof schema !== 'object') return schema;
+  const node: any = Array.isArray(schema) ? [...schema] : { ...schema };
+
+  // 修正 required：仅保留确实存在于 properties 的字段
+  if (Array.isArray(node.required)) {
+    const props = node.properties && typeof node.properties === 'object'
+      ? Object.keys(node.properties)
+      : [];
+    const filtered = node.required.filter((r: unknown) => typeof r === 'string' && props.includes(r));
+    if (filtered.length > 0) node.required = filtered;
+    else delete node.required;
+  }
+
+  // 递归 properties
+  if (node.properties && typeof node.properties === 'object') {
+    const newProps: Record<string, unknown> = {};
+    for (const k of Object.keys(node.properties)) {
+      newProps[k] = sanitizeSchema(node.properties[k]);
+    }
+    node.properties = newProps;
+  }
+  // 递归 items
+  if (node.items) node.items = sanitizeSchema(node.items);
+
+  return node;
+}
+
 // 按分组缓存聚合工具
 interface ToolsCache { fetchedAt: number; tools: McpTool[]; }
 const groupCache: Record<string, ToolsCache> = {};
 const inflight: Record<string, Promise<McpTool[]> | undefined> = {};
 
-/** 拉取并聚合某分组的工具（带缓存 + 单飞 + 安全/危险过滤 + 前缀） */
-async function getGroupTools(group: GroupDef, dingtalkToken: string): Promise<McpTool[]> {
-  const now = Date.now();
-  const cached = groupCache[group.key];
-  if (cached && now - cached.fetchedAt < TOOLS_CACHE_TTL_MS) return cached.tools;
-  if (inflight[group.key]) return inflight[group.key]!;
+/** 拉取并聚合某分组的工具（带缓存 + 单飞 + 安全/危险过滤 + 前缀）
+ *  serverSubset: 仅用于调试二分，传入则只聚合子集且不走缓存 */
+async function getGroupTools(
+  group: GroupDef,
+  dingtalkToken: string,
+  serverSubset?: string[]
+): Promise<McpTool[]> {
+  const useServers = serverSubset && serverSubset.length > 0
+    ? group.servers.filter((s) => serverSubset.includes(s))
+    : group.servers;
+  const isSubset = serverSubset && serverSubset.length > 0;
 
-  inflight[group.key] = (async () => {
+  const now = Date.now();
+  if (!isSubset) {
+    const cached = groupCache[group.key];
+    if (cached && now - cached.fetchedAt < TOOLS_CACHE_TTL_MS) return cached.tools;
+    if (inflight[group.key]) return inflight[group.key]!;
+  }
+
+  const build = (async () => {
     const results = await Promise.allSettled(
-      group.servers.map((s) => callUpstream(s, 'tools/list', dingtalkToken, {}, `list-${s}`))
+      useServers.map((s) => callUpstream(s, 'tools/list', dingtalkToken, {}, `list-${s}`))
     );
     const aggregated: McpTool[] = [];
     results.forEach((r, idx) => {
-      const server = group.servers[idx];
+      const server = useServers[idx];
       if (r.status !== 'fulfilled') {
         console.warn(`[aggregator:${group.key}] ${server} tools/list 失败，跳过`);
         return;
@@ -175,18 +265,26 @@ async function getGroupTools(group: GroupDef, dingtalkToken: string): Promise<Mc
             description;
         }
         aggregated.push({
-          name: `${server}${PREFIX_SEP}${t.name}`,
+          name: buildToolName(server, t.name),
           title: t.title,
           description,
-          inputSchema: t.inputSchema,
+          inputSchema: sanitizeSchema(t.inputSchema),
         });
       }
     });
-    groupCache[group.key] = { fetchedAt: Date.now(), tools: aggregated };
-    console.log(`[aggregator:${group.key}] 刷新完成: ${aggregated.length} 个工具`);
+    if (!isSubset) {
+      groupCache[group.key] = { fetchedAt: Date.now(), tools: aggregated };
+    }
+    console.log(`[aggregator:${group.key}] 刷新完成: ${aggregated.length} 个工具${isSubset ? ` (子集: ${useServers.join(',')})` : ''}`);
     return aggregated;
   })();
 
+  if (isSubset) {
+    // 子集模式：不缓存、不单飞，直接返回
+    return await build;
+  }
+
+  inflight[group.key] = build;
   try {
     return await inflight[group.key]!;
   } finally {
@@ -195,6 +293,10 @@ async function getGroupTools(group: GroupDef, dingtalkToken: string): Promise<Mc
 }
 
 function splitPrefixedName(prefixed: string): { server: string; tool: string } | null {
+  // 优先查缩短名映射（被缩短的工具名无法靠 __ 还原原始 tool）
+  const mapped = shortNameMap.get(prefixed);
+  if (mapped) return mapped;
+
   const sep = prefixed.indexOf(PREFIX_SEP);
   if (sep <= 0) return null;
   const server = prefixed.slice(0, sep);
@@ -267,7 +369,10 @@ export function createMcpAggregatorRouter(storage: IStorage): Router {
           return;
 
         case 'tools/list': {
-          const tools = await getGroupTools(group, dingtalkToken);
+          // 调试用：?servers=oa,mail 仅聚合子集（二分排查 Quick 创建失败）
+          const subsetRaw = (req.query.servers as string) || '';
+          const subset = subsetRaw.split(',').map((s) => s.trim()).filter(Boolean);
+          const tools = await getGroupTools(group, dingtalkToken, subset);
           res.json(jsonRpcResult(id, { tools }));
           return;
         }
@@ -275,9 +380,15 @@ export function createMcpAggregatorRouter(storage: IStorage): Router {
         case 'tools/call': {
           const prefixedName = params?.name;
           if (!prefixedName) { res.json(jsonRpcError(id, -32602, '缺少 tool name')); return; }
-          const parsed = splitPrefixedName(prefixedName);
+          let parsed = splitPrefixedName(prefixedName);
+          // 兜底：缩短名映射可能因实例重启/未调用过 tools/list 而缺失，
+          // 先触发本组 tools/list 填充 shortNameMap 后重试一次。
           if (!parsed) {
-            res.json(jsonRpcError(id, -32602, `无效的工具名: ${prefixedName}（应为 <server>__<tool>）`));
+            await getGroupTools(group, dingtalkToken);
+            parsed = splitPrefixedName(prefixedName);
+          }
+          if (!parsed) {
+            res.json(jsonRpcError(id, -32602, `无效的工具名: ${prefixedName}`));
             return;
           }
           // 校验该工具确实属于本分组（防止跨组调用绕过危险隔离）

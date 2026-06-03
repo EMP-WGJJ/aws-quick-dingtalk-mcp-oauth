@@ -88,6 +88,11 @@ https://quick.aws.com/sn/oauthcallback
 
 工具名采用 `<server>__<tool>` 前缀（如 `calendar__list_calendars`），便于区分来源。
 
+> **工具名规范**：Amazon Quick 要求工具名仅含 `[a-zA-Z0-9_-]` 且不宜过长。网关会对上游工具名自动消毒
+> （非法字符如中文、点号 `.` 替换为 `_`）并控制长度（全名 ≤38，超长截断 + 哈希后缀），
+> 调用时通过内部映射还原为钉钉原始工具名。否则含非法字符的工具名（如 teambition 的中文名）会导致
+> Quick 创建 connector 失败（Creation failed）。
+
 ### 5 个分组 endpoint
 
 | 分组 | MCP Endpoint | 建议 connector 名 | 工具数 | 内容 |

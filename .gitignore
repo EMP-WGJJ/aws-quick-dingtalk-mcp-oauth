@@ -43,4 +43,7 @@ coverage/
 check-schema.cjs
 office.json
 comm.json
+diff-check.cjs
+tables.json
+tb.json
 /*.dump.json
