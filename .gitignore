@@ -1,0 +1,46 @@
+# ───── 依赖与构建产物 ─────
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# ───── 日志 ─────
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ───── 环境变量与密钥（敏感，切勿提交） ─────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# ───── 部署产物与本地配置（含账号/资源 ARN 等敏感信息） ─────
+.deploy-config
+.cdk-outputs*.json
+cdk.out/
+
+# 含真实域名/AppKey 的内部文档（对外用脱敏版 *.md）
+*.local.md
+
+# ───── 编辑器 / 操作系统 ─────
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+
+# ───── 运行时缓存 ─────
+.cache/
+coverage/
+*.local
+
+# ───── 本地调试产物（MCP 工具 dump、临时校验脚本等） ─────
+check-schema.cjs
+office.json
+comm.json
+/*.dump.json

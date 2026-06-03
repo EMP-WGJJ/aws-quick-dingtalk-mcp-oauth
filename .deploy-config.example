@@ -1,0 +1,31 @@
+# dingtalk-mcp-oauth-gateway 部署配置模板
+#
+# 用法：
+#   1. 复制为 .deploy-config：  cp .deploy-config.example .deploy-config
+#   2. 按下方注释填入你自己的账号 / 资源信息
+#   3. 运行 scripts/deploy.sh（首次部署）或 scripts/redeploy.sh（发版）
+#
+# 注意：.deploy-config 含账号/资源信息，已在 .gitignore 中排除，请勿提交。
+#       首次执行 scripts/deploy.sh 会自动生成并回填该文件，也可手动填写。
+
+# ─── 基础信息 ─────────────────────────────────────────────────────────
+DEPLOY_REGION="ap-southeast-1"                 # 部署区域
+DEPLOY_ACCOUNT="<你的 AWS 账号 ID>"            # 12 位 AWS Account ID
+STACK_NAME="dingtalk-mcp-gateway"              # CloudFormation 栈名
+ECR_REPO_NAME="dingtalk-mcp-gateway-repo"      # ECR 仓库名
+ECR_URI="<account-id>.dkr.ecr.<region>.amazonaws.com/dingtalk-mcp-gateway-repo"  # ECR 仓库 URI
+CLUSTER_NAME="dingtalk-mcp-gateway-cluster"    # ECS 集群名
+SERVICE_NAME="dingtalk-mcp-gateway-service"    # ECS 服务名
+
+# ─── CloudFormation 参数 ──────────────────────────────────────────────
+VPC_ID="<vpc-xxxxxxxx>"                                          # 目标 VPC
+PUBLIC_SUBNETS="<subnet-aaa>,<subnet-bbb>"                       # ALB 用的公有子网（逗号分隔）
+PRIVATE_SUBNETS="<subnet-ccc>,<subnet-ddd>"                      # Fargate 用的子网（需可出公网，逗号分隔）
+CERT_ARN="arn:aws:acm:<region>:<account-id>:certificate/<cert-id>"  # 覆盖网关域名的 ACM 证书 ARN
+BASE_URL="https://<你的网关域名>"                                # 对外网关域名
+APP_KEY="<你的钉钉 AppKey>"                                      # 钉钉应用 AppKey
+APP_SECRET_ARN="arn:aws:secretsmanager:<region>:<account-id>:secret:dingtalk-mcp-gateway/dingtalk-app-secret-xxxxxx"  # Secrets Manager 中钉钉 AppSecret 的 ARN
+QUICK_CLIENT_ID="amazon_quick_001"                              # 预分配给 Quick 的 client_id
+QUICK_REDIRECT_URI="https://us-east-1.quicksight.aws.amazon.com/sn/oauthcallback"  # Quick 回调白名单（逗号分隔可填多个）
+DESIRED_COUNT="2"                                               # ECS 期望实例数
+CONTAINER_PORT="3000"                                           # 容器监听端口

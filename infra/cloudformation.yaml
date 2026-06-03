@@ -1,0 +1,342 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DingTalk MCP OAuth Gateway - ECS Fargate + DynamoDB + KMS.
+  Deploys DynamoDB table, KMS Key, ALB (HTTPS, idle timeout 300s for SSE)
+  and ECS Fargate service on an existing VPC / subnets / ACM certificate.
+
+# ============================================================
+# Parameters
+# ============================================================
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Target VPC
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets for the ALB (>=2, across AZs)
+
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for Fargate tasks (private subnets with NAT egress for DingTalk API)
+
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN for the ALB HTTPS listener
+
+  ImageUri:
+    Type: String
+    Description: Container image URI (already pushed to ECR, with tag)
+
+  BaseUrl:
+    Type: String
+    Description: Public HTTPS URL of the gateway, e.g. https://gateway.example.com
+
+  DingtalkAppKey:
+    Type: String
+    Description: DingTalk app AppKey
+
+  DingtalkAppSecretArn:
+    Type: String
+    Description: Secrets Manager ARN holding the DingTalk AppSecret
+
+  QuickClientId:
+    Type: String
+    Default: amazon_quick_001
+    Description: Amazon Quick pre-allocated client_id
+
+  QuickRedirectUri:
+    Type: String
+    Default: https://quick.aws.com/sn/oauthcallback
+    Description: Amazon Quick redirect URI
+
+  DesiredCount:
+    Type: Number
+    Default: 2
+    Description: Desired Fargate task count (>=2 for high availability)
+
+  ContainerPort:
+    Type: Number
+    Default: 3000
+    Description: Container listening port
+
+# ============================================================
+# Resources
+# ============================================================
+Resources:
+
+  # ---------- KMS: encrypt DingTalk tokens and other sensitive fields ----------
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: DingTalk MCP Gateway sensitive field encryption key
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-key'
+      TargetKeyId: !Ref EncryptionKey
+
+  # ---------- DynamoDB: single table, on-demand billing, TTL ----------
+  GatewayTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-table'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expireAt
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # ---------- ECR repository is created idempotently by deploy.sh via CLI ----------
+  # (image must exist before the ECS service starts, so repo + push precede this stack)
+
+  # ---------- CloudWatch logs ----------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}'
+      RetentionInDays: 30
+
+  # ---------- Security groups ----------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB security group, allow public HTTPS
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS from internet
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate service security group, allow traffic only from the ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: From ALB
+
+  # ---------- ALB ----------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      Type: application
+      Scheme: internet-facing
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      LoadBalancerAttributes:
+        # Raise idle timeout to support SSE long connections
+        - Key: idle_timeout.timeout_seconds
+          Value: '300'
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-tg'
+      VpcId: !Ref VpcId
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        # Graceful shutdown: drain time for in-flight requests
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------- IAM roles ----------
+  # Execution role: pull ECR image, write logs, read Secrets
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ReadSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DingtalkAppSecretArn
+
+  # Task role: application runtime access to DynamoDB and KMS
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DynamoAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:TransactWriteItems
+                Resource: !GetAtt GatewayTable.Arn
+        - PolicyName: KmsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                Resource: !GetAtt EncryptionKey.Arn
+
+  # ---------- ECS ----------
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-cluster'
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-task'
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: gateway
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: PORT
+              Value: !Ref ContainerPort
+            - Name: BASE_URL
+              Value: !Ref BaseUrl
+            - Name: STORAGE_DRIVER
+              Value: dynamo
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DYNAMO_TABLE_NAME
+              Value: !Ref GatewayTable
+            - Name: KMS_KEY_ID
+              Value: !Ref EncryptionKey
+            - Name: DINGTALK_APP_KEY
+              Value: !Ref DingtalkAppKey
+            - Name: QUICK_CLIENT_ID
+              Value: !Ref QuickClientId
+            - Name: QUICK_REDIRECT_URI
+              Value: !Ref QuickRedirectUri
+          Secrets:
+            - Name: DINGTALK_APP_SECRET
+              ValueFrom: !Ref DingtalkAppSecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: HttpsListener
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}-service'
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      # Rolling update: start new tasks healthy before stopping old ones (zero-downtime with graceful shutdown)
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      HealthCheckGracePeriodSeconds: 30
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # Fargate in private subnets, egress via NAT, no public IP needed
+          AssignPublicIp: DISABLED
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+      LoadBalancers:
+        - ContainerName: gateway
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  AlbDnsName:
+    Description: ALB DNS name (point the gateway domain CNAME to it)
+    Value: !GetAtt LoadBalancer.DNSName
+
+  TableName:
+    Description: DynamoDB table name
+    Value: !Ref GatewayTable
+
+  KmsKeyId:
+    Description: KMS Key ID
+    Value: !Ref EncryptionKey

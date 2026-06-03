@@ -1,0 +1,42 @@
+{
+  "name": "dingtalk-mcp-oauth-gateway",
+  "version": "1.0.0",
+  "description": "为 MCP Client 提供标准 OAuth 2.1 接入，代理钉钉 OpenAPI",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc",
+    "lint": "tsc --noEmit",
+    "test:dynamo": "tsx test-dynamo.ts"
+  },
+  "keywords": [
+    "mcp",
+    "oauth",
+    "dingtalk",
+    "gateway"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1057.0",
+    "@aws-sdk/client-kms": "^3.1057.0",
+    "@aws-sdk/lib-dynamodb": "^3.1057.0",
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "cors": "^2.8.5",
+    "crypto-js": "^4.2.0",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "uuid": "^11.1.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.18",
+    "@types/crypto-js": "^4.2.2",
+    "@types/express": "^5.0.2",
+    "@types/node": "^22.15.21",
+    "@types/uuid": "^10.0.0",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}
