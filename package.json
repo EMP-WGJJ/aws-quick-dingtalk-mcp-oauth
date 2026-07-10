@@ -8,7 +8,9 @@
     "start": "node dist/index.js",
     "build": "tsc",
     "lint": "tsc --noEmit",
-    "test:dynamo": "tsx test-dynamo.ts"
+    "test:dynamo": "tsx test-dynamo.ts",
+    "local": "tsx src/local/index.ts",
+    "local:auth": "tsx -e \"require('./src/local/auth').localLogin(process.env.DINGTALK_APP_KEY,process.env.DINGTALK_APP_SECRET)\""
   },
   "keywords": [
     "mcp",
