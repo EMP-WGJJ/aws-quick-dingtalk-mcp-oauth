@@ -25,6 +25,7 @@
 import dotenv from 'dotenv';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { loadToken, isTokenExpired, refreshAndSave, LocalToken } from './token-store';
 import { localLogin } from './auth';
 import { listTools, callTool } from './proxy';
@@ -94,10 +95,9 @@ async function main(): Promise<void> {
   );
 
   // 注册动态工具处理
-  // MCP SDK 的 tool() 需要预注册，但我们的工具列表是动态的（来自上游）
-  // 使用底层 server 的 setRequestHandler 直接处理 tools/list 和 tools/call
+  // 使用底层 server 的 setRequestHandler + SDK schema 处理 tools/list 和 tools/call
   server.server.setRequestHandler(
-    { method: 'tools/list' } as any,
+    ListToolsRequestSchema,
     async () => {
       // 确保 token 有效
       token = await ensureToken();
@@ -107,8 +107,8 @@ async function main(): Promise<void> {
   );
 
   server.server.setRequestHandler(
-    { method: 'tools/call' } as any,
-    async (request: any) => {
+    CallToolRequestSchema,
+    async (request) => {
       // 确保 token 有效
       token = await ensureToken();
 
@@ -122,13 +122,13 @@ async function main(): Promise<void> {
         }
         return {
           content: [
-            { type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result, null, 2) },
+            { type: 'text' as const, text: typeof result === 'string' ? result : JSON.stringify(result, null, 2) },
           ],
         };
       } catch (err) {
         return {
           content: [
-            { type: 'text', text: `错误: ${err instanceof Error ? err.message : '未知错误'}` },
+            { type: 'text' as const, text: `错误: ${err instanceof Error ? err.message : '未知错误'}` },
           ],
           isError: true,
         };
